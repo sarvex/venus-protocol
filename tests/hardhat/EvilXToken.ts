@@ -3,7 +3,7 @@ import chai from "chai";
 import { ethers } from "hardhat";
 
 import { convertToUnit } from "../../helpers/utils";
-import { ComptrollerHarness__factory, IAccessControlManager } from "../../typechain";
+import { ComptrollerHarness__factory, IAccessControlManager, StableRateModel } from "../../typechain";
 
 const { expect } = chai;
 
@@ -17,6 +17,9 @@ describe("Evil Token test", async () => {
       "contracts/Governance/IAccessControlManager.sol:IAccessControlManager",
     );
     accessControlMock.isAllowedToCall.returns(true);
+
+    const stableInterestRateModel = await smock.fake<StableRateModel>("StableRateModel");
+    stableInterestRateModel.isInterestRateModel.returns(true);
 
     user = account1;
     const cf1 = 0.5,
@@ -101,6 +104,8 @@ describe("Evil Token test", async () => {
     await vDelegator1.deployed();
 
     vToken1 = await ethers.getContractAt("VBep20MockDelegate", vDelegator1.address);
+
+    await vToken1.connect(user).setStableInterestRateModel(stableInterestRateModel.address);
 
     await unitroller._supportMarket(vToken1.address);
     await unitroller._setCollateralFactor(vToken1.address, convertToUnit(cf1, 18));
