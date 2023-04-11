@@ -2,17 +2,20 @@ pragma solidity 0.8.13;
 
 import "../../../Utils/V0.8.13/ErrorReporter.sol";
 import "../../../Utils/V0.8.13/Exponential.sol";
+import "../../../Utils/V0.8.13/SafeMath.sol";
 import "../EIP20Interface.sol";
 import "../EIP20NonStandardInterface.sol";
 import "../../../InterestRateModels/V0.8.13/InterestRateModel.sol";
 import "./VTokenInterfaces.sol";
+import "../../../InterestRateModels/V0.8.13/StableRateModel.sol";
 
 /**
  * @title Venus's vToken Contract
  * @notice Abstract base for vTokens
  * @author Venus
  */
-contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
+abstract contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
+    using SafeMath for uint;
     struct MintLocalVars {
         MathError mathErr;
         uint exchangeRateMantissa;
@@ -286,11 +289,49 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
      * @return The supply interest rate per block, scaled by 1e18
      */
     function supplyRatePerBlock() external view override returns (uint) {
-        return interestRateModel.getSupplyRate(getCashPrior(), totalBorrows, totalReserves, reserveFactorMantissa);
+        if (totalBorrows == 0) {
+            return 0;
+        }
+        uint256 utilizationRate = utilizationRate(getCashPrior(), totalBorrows, totalReserves);
+        uint256 averageMarketBorrowRate = _averageMarketBorrowRate();
+        return
+            (averageMarketBorrowRate.mul(utilizationRate).mul(mantissaOne.sub(reserveFactorMantissa))).div(
+                mantissaOne.mul(mantissaOne)
+            );
+    }
+
+    /// @notice Calculate the average market borrow rate with respect to variable and stable borrows
+    function _averageMarketBorrowRate() internal view returns (uint256) {
+        uint256 variableBorrowNew;
+        uint256 stbleBorrowNew;
+        uint256 totalBorrowNew;
+        uint256 _averageMarketBorrowRate;
+        uint256 variableBorrowRate = interestRateModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
+        (MathError mathErr, uint256 variableBorrows) = subUInt(totalBorrows, stableBorrows);
+        if (mathErr != MathError.NO_ERROR) {
+            revert("math error");
+        }
+        (mathErr, variableBorrowNew) = mulUInt(variableBorrows, variableBorrowRate);
+        if (mathErr != MathError.NO_ERROR) {
+            revert("math error");
+        }
+        (mathErr, stbleBorrowNew) = mulUInt(stableBorrows, averageStableBorrowRate);
+        if (mathErr != MathError.NO_ERROR) {
+            revert("math error");
+        }
+        (mathErr, totalBorrowNew) = addUInt(variableBorrowNew, stbleBorrowNew);
+        if (mathErr != MathError.NO_ERROR) {
+            revert("math error");
+        }
+        (mathErr, _averageMarketBorrowRate) = divUInt(totalBorrowNew, totalBorrows);
+        if (mathErr != MathError.NO_ERROR) {
+            revert("math error");
+        }
+        return _averageMarketBorrowRate;
     }
 
     /**
-     * @notice Returns the current per-block borrow interest rate for this vToken
+     * @notice Calculate the current per-block borrow interest rate for this vToken
      * @return The borrow interest rate per block, scaled by 1e18
      */
     function borrowRatePerBlock() external view override returns (uint) {
@@ -376,7 +417,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
 
         /* Read the previous values out of storage */
         uint cashPrior = getCashPrior();
-        uint borrowsPrior = totalBorrows;
+        uint borrowsPrior = totalBorrows - stableBorrows;
         uint reservesPrior = totalReserves;
         uint borrowIndexPrior = borrowIndex;
 
@@ -433,6 +474,8 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
                 );
         }
 
+        totalBorrowsNew = totalBorrowsNew + stableBorrows;
+
         (mathErr, totalReservesNew) = mulScalarTruncateAddUInt(
             Exp({ mantissa: reserveFactorMantissa }),
             interestAccumulated,
@@ -467,8 +510,14 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         totalBorrows = totalBorrowsNew;
         totalReserves = totalReservesNew;
 
+        uint256 err = _accrueStableInterest(blockDelta);
+
+        if (err != 0) {
+            return err;
+        }
+
         /* We emit an AccrueInterest event */
-        emit AccrueInterest(cashPrior, interestAccumulated, borrowIndexNew, totalBorrowsNew);
+        emit AccrueInterest(cashPrior, interestAccumulated, borrowIndexNew, totalBorrowsNew, stableBorrowIndex);
 
         return uint(Error.NO_ERROR);
     }
@@ -488,6 +537,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         ComptrollerInterface oldComptroller = comptroller;
         // Ensure invoke comptroller.isComptroller() returns true
         require(newComptroller.isComptroller(), "marker method returned false");
+
         // Set market's comptroller to newComptroller
         comptroller = newComptroller;
 
@@ -514,6 +564,72 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
     }
 
     /**
+     * @notice Accrues interest and updates the stable interest rate model using _setStableInterestRateModelFresh
+     * @dev Admin function to accrue interest and update the stable interest rate model
+     * @param newStableInterestRateModel The new interest rate model to use
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     * custom:events Emits NewMarketInterestRateModel event; may emit AccrueInterest
+     * custom:events Emits NewMarketStableInterestRateModel, after setting the new stable rate model
+     */
+    function setStableInterestRateModel(
+        StableRateModel newStableInterestRateModel
+    ) public virtual override returns (uint256) {
+        // Check caller is admin
+        if (msg.sender != admin) {
+            return fail(Error.UNAUTHORIZED, FailureInfo.SET_STABLE_INTEREST_RATE_MODEL_OWNER_CHECK);
+        }
+
+        uint error = accrueInterest();
+        if (error != uint(Error.NO_ERROR)) {
+            // accrueInterest emits logs on errors, but on top of that we want to log the fact that an attempted change of interest rate model failed
+            return fail(Error(error), FailureInfo.SET_INTEREST_RATE_MODEL_ACCRUE_INTEREST_FAILED);
+        }
+
+        // We fail gracefully unless market's block number equals current block number
+        if (accrualBlockNumber != getBlockNumber()) {
+            return fail(Error.MARKET_NOT_FRESH, FailureInfo.SET_STABLE_INTEREST_RATE_MODEL_FRESH_CHECK);
+        }
+
+        // _setInterestRateModelFresh emits interest-rate-model-update-specific logs on errors, so we don't need to.
+        return _setStableInterestRateModelFresh(newStableInterestRateModel);
+    }
+
+    /**
+     * @notice Calculate the current per-block borrow interest rate for this vToken
+     * @return rate The Stable borrow interest rate per block, scaled by 1e18
+     */
+    function stableBorrowRatePerBlock() public view returns (uint256) {
+        uint256 variableBorrowRate = interestRateModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
+        return stableRateModel.getBorrowRate(stableBorrows, totalBorrows, variableBorrowRate);
+    }
+
+    /**
+     * @notice Calculates the utilization rate of the market: `borrows / (cash + borrows - reserves)`
+     * @param cash The amount of cash in the market
+     * @param borrows The amount of borrows in the market
+     * @param reserves The amount of reserves in the market (currently unused)
+     * @return The utilization rate as a mantissa between [0, 1e18]
+     */
+    function utilizationRate(uint cash, uint borrows, uint reserves) public pure returns (uint) {
+        // Utilization rate is 0 when there are no borrows
+        if (borrows == 0) {
+            return 0;
+        }
+        return (borrows * mantissaOne) / (cash + borrows - reserves);
+    }
+
+    /**
+     * @notice Return the borrow balance of account based on stored data
+     * @param account The address whose balance should be calculated
+     * @return The calculated balance
+     */
+    function borrowBalanceStored(address account) public view override returns (uint) {
+        (uint256 stableBorrowAmount, , ) = _stableBorrowBalanceStored(account);
+        (, uint256 _borrowBalanceStored) = borrowBalanceStoredInternal(account);
+        return stableBorrowAmount + _borrowBalanceStored;
+    }
+
+    /**
      * @notice Calculates the exchange rate from the underlying to the VToken
      * @dev This function does not accrue interest before calculating the exchange rate
      * @return Calculated exchange rate scaled by 1e18
@@ -525,14 +641,72 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
     }
 
     /**
-     * @notice Return the borrow balance of account based on stored data
-     * @param account The address whose balance should be calculated
-     * @return The calculated balance
+     * @notice Applies accrued interest to stable borrows and reserves
+     * @dev This calculates interest accrued from the last checkpointed block
+     *   up to the current block and writes new checkpoint to storage.
+     * @param blockDelta the number of blocks elapsed since the last accrual
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
      */
-    function borrowBalanceStored(address account) public view override returns (uint) {
-        (MathError err, uint result) = borrowBalanceStoredInternal(account);
-        require(err == MathError.NO_ERROR, "borrowBalanceStored: borrowBalanceStoredInternal failed");
-        return result;
+    function _accrueStableInterest(uint256 blockDelta) internal returns (uint256) {
+        uint256 stableIndexPrior = stableBorrowIndex;
+
+        uint256 stableBorrowRateMantissa = stableBorrowRatePerBlock();
+        require(stableBorrowRateMantissa <= stableBorrowRateMaxMantissa, "vToken: stable borrow rate is absurdly high");
+
+        Exp memory simpleStableInterestFactor = mul_(Exp({ mantissa: stableBorrowRateMantissa }), blockDelta);
+
+        uint256 stableBorrowIndexNew = mul_ScalarTruncateAddUInt(
+            simpleStableInterestFactor,
+            stableIndexPrior,
+            stableIndexPrior
+        );
+
+        /////////////////////////
+        // EFFECTS & INTERACTIONS
+        // (No safe failures beyond this point)
+
+        /* We write the previously calculated values into storage */
+        stableBorrowIndex = stableBorrowIndexNew;
+
+        return uint256(MathError.NO_ERROR);
+    }
+
+    /**
+     * @notice Return the stable borrow balance of account based on stored data
+     * @param account The address whose balance should be calculated
+     * @return Stable borrowBalance the calculated balance
+     * custom:events UpdatedUserStableBorrowBalance event emitted after updating account's borrow
+     */
+    function _updateUserStableBorrowBalance(address account) internal returns (uint256) {
+        StableBorrowSnapshot storage borrowSnapshot = accountStableBorrows[account];
+
+        Exp memory simpleStableInterestFactor;
+        uint256 principalUpdated;
+        uint256 stableBorrowIndexNew;
+
+        (principalUpdated, stableBorrowIndexNew, simpleStableInterestFactor) = _stableBorrowBalanceStored(account);
+        uint256 stableBorrowsPrior = stableBorrows;
+        uint256 totalBorrowsPrior = totalBorrows;
+        uint256 totalReservesPrior = totalReserves;
+
+        uint256 stableInterestAccumulated = mul_ScalarTruncate(simpleStableInterestFactor, borrowSnapshot.principal);
+        uint256 stableBorrowsUpdated = stableBorrowsPrior + stableInterestAccumulated;
+        uint256 totalBorrowsUpdated = totalBorrowsPrior + stableInterestAccumulated;
+        uint256 totalReservesUpdated = mul_ScalarTruncateAddUInt(
+            Exp({ mantissa: reserveFactorMantissa }),
+            stableInterestAccumulated,
+            totalReservesPrior
+        );
+
+        stableBorrows = stableBorrowsUpdated;
+        totalBorrows = totalBorrowsUpdated;
+        totalReserves = totalReservesUpdated;
+        borrowSnapshot.interestIndex = stableBorrowIndexNew;
+        borrowSnapshot.principal = principalUpdated;
+        borrowSnapshot.lastBlockAccrued = getBlockNumber();
+
+        emit UpdatedUserStableBorrowBalance(account, principalUpdated);
+        return principalUpdated;
     }
 
     /**
@@ -559,7 +733,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         /* Get the allowance, infinite for the account owner */
         uint startingAllowance = 0;
         if (spender == src) {
-            startingAllowance = type(uint).max;
+            startingAllowance = type(uint256).max;
         } else {
             startingAllowance = transferAllowances[src][spender];
         }
@@ -593,7 +767,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         accountTokens[dst] = dstTokensNew;
 
         /* Eat some of the allowance (if necessary) */
-        if (startingAllowance != type(uint).max) {
+        if (startingAllowance != type(uint256).max) {
             transferAllowances[src][spender] = allowanceNew;
         }
 
@@ -993,7 +1167,26 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
             return fail(Error(error), FailureInfo.BORROW_ACCRUE_INTEREST_FAILED);
         }
         // borrowFresh emits borrow-specific logs on errors, so we don't need to
-        return borrowFresh(borrower, receiver, borrowAmount);
+        return borrowFresh(borrower, receiver, borrowAmount, InterestRateMode.VARIABLE);
+    }
+
+    function borrowStableInternal(
+        address borrower,
+        address payable receiver,
+        uint256 borrowAmount
+    ) internal nonReentrant returns (uint) {
+        accrueInterest();
+
+        // borrowFresh emits borrow-specific logs on errors, so we don't need to
+        return borrowFresh(borrower, receiver, borrowAmount, InterestRateMode.STABLE);
+    }
+
+    struct stableBorrowVars {
+        uint256 accountBorrowsPrev;
+        uint256 stableBorrowsNew;
+        uint256 stableBorrowRate;
+        uint256 averageStableBorrowRateNew;
+        uint256 stableRateMantissaNew;
     }
 
     /**
@@ -1002,13 +1195,19 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
      * @param borrower The borrower, on behalf of whom to borrow
      * @param receiver The account that would receive the funds (can be the same as the borrower)
      * @param borrowAmount The amount of the underlying asset to borrow
+     * @param interestRateMode The interest rate mode at which the user wants to borrow: 1 for Stable, 2 for Variable
      * @return uint Returns 0 on success, otherwise returns a failure code (see ErrorReporter.sol for details).
      */
-    function borrowFresh(address borrower, address payable receiver, uint borrowAmount) internal returns (uint) {
+    function borrowFresh(
+        address borrower,
+        address payable receiver,
+        uint borrowAmount,
+        InterestRateMode interestRateMode
+    ) internal returns (uint) {
         /* Fail if borrow not allowed */
         uint allowed = comptroller.borrowAllowed(address(this), borrower, borrowAmount);
         if (allowed != 0) {
-            revert("math error");
+            return (failOpaque(Error.COMPTROLLER_REJECTION, FailureInfo.BORROW_COMPTROLLER_REJECTION, allowed));
         }
 
         /* Verify market's block number equals current block number */
@@ -1021,36 +1220,72 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
             revert("math error");
         }
 
-        BorrowLocalVars memory vars;
+        uint256 totalBorrowsNew;
+        uint256 accountBorrowsNew;
+        if (InterestRateMode(interestRateMode) == InterestRateMode.STABLE) {
+            stableBorrowVars memory vars;
+            /*
+             * We calculate the new borrower and total borrow balances, failing on overflow:
+             *  accountBorrowNew = accountStableBorrow + borrowAmount
+             *  totalBorrowsNew = totalBorrows + borrowAmount
+             */
+            vars.accountBorrowsPrev = _updateUserStableBorrowBalance(borrower);
+            accountBorrowsNew = vars.accountBorrowsPrev.add(borrowAmount);
+            totalBorrowsNew = totalBorrows.add(borrowAmount);
 
-        /*
-         * We calculate the new borrower and total borrow balances, failing on overflow:
-         *  accountBorrowsNew = accountBorrows + borrowAmount
-         *  totalBorrowsNew = totalBorrows + borrowAmount
-         */
-        (vars.mathErr, vars.accountBorrows) = borrowBalanceStoredInternal(borrower);
-        if (vars.mathErr != MathError.NO_ERROR) {
-            revert("math error");
+            /**
+             * Calculte the average stable borrow rate for the total stable borrows
+             */
+
+            vars.stableBorrowsNew = stableBorrows.add(borrowAmount);
+            vars.stableBorrowRate = stableBorrowRatePerBlock();
+            vars.averageStableBorrowRateNew = (
+                stableBorrows.mul(averageStableBorrowRate).add(borrowAmount.mul(vars.stableBorrowRate))
+            ).div(vars.stableBorrowsNew);
+
+            vars.stableRateMantissaNew = (
+                vars.accountBorrowsPrev.mul(accountStableBorrows[borrower].stableRateMantissa).add(
+                    borrowAmount.mul(vars.stableBorrowRate)
+                )
+            ).div(accountBorrowsNew);
+
+            /////////////////////////
+            // EFFECTS & INTERACTIONS
+            // (No safe failures beyond this point)
+
+            /*
+             * We write the previously calculated values into storage.
+             *  Note: Avoid token reentrancy attacks by writing increased borrow before external transfer.
+             */
+
+            accountStableBorrows[borrower].principal = accountBorrowsNew;
+            accountStableBorrows[borrower].interestIndex = stableBorrowIndex;
+            accountStableBorrows[borrower].stableRateMantissa = vars.stableRateMantissaNew;
+            stableBorrows = vars.stableBorrowsNew;
+            averageStableBorrowRate = vars.averageStableBorrowRateNew;
+        } else {
+            /*
+             * We calculate the new borrower and total borrow balances, failing on overflow:
+             *  accountBorrowNew = accountBorrow + borrowAmount
+             *  totalBorrowsNew = totalBorrows + borrowAmount
+             */
+            (, uint256 accountBorrowsPrev) = borrowBalanceStoredInternal(borrower);
+            accountBorrowsNew = accountBorrowsPrev.add(borrowAmount);
+            totalBorrowsNew = totalBorrows.add(borrowAmount);
+
+            /////////////////////////
+            // EFFECTS & INTERACTIONS
+            // (No safe failures beyond this point)
+
+            /*
+             * We write the previously calculated values into storage.
+             *  Note: Avoid token reentrancy attacks by writing increased borrow before external transfer.
+             */
+            accountBorrows[borrower].principal = accountBorrowsNew;
+            accountBorrows[borrower].interestIndex = borrowIndex;
         }
 
-        (vars.mathErr, vars.accountBorrowsNew) = addUInt(vars.accountBorrows, borrowAmount);
-        if (vars.mathErr != MathError.NO_ERROR) {
-            revert("math error");
-        }
-
-        (vars.mathErr, vars.totalBorrowsNew) = addUInt(totalBorrows, borrowAmount);
-        if (vars.mathErr != MathError.NO_ERROR) {
-            revert("math error");
-        }
-
-        /////////////////////////
-        // EFFECTS & INTERACTIONS
-        // (No safe failures beyond this point)
-
-        /* We write the previously calculated values into storage */
-        accountBorrows[borrower].principal = vars.accountBorrowsNew;
-        accountBorrows[borrower].interestIndex = borrowIndex;
-        totalBorrows = vars.totalBorrowsNew;
+        totalBorrows = totalBorrowsNew;
 
         /*
          * We invoke doTransferOut for the borrower and the borrowAmount.
@@ -1061,11 +1296,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         doTransferOut(receiver, borrowAmount);
 
         /* We emit a Borrow event */
-        emit Borrow(borrower, borrowAmount, vars.accountBorrowsNew, vars.totalBorrowsNew);
-
-        /* We call the defense hook */
-        comptroller.borrowVerify(address(this), borrower, borrowAmount);
-
+        emit Borrow(borrower, borrowAmount, accountBorrowsNew, totalBorrowsNew);
         return uint(Error.NO_ERROR);
     }
 
@@ -1081,7 +1312,21 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
             return (fail(Error(error), FailureInfo.REPAY_BORROW_ACCRUE_INTEREST_FAILED), 0);
         }
         // repayBorrowFresh emits repay-borrow-specific logs on errors, so we don't need to
-        return repayBorrowFresh(msg.sender, msg.sender, repayAmount);
+        return repayBorrowFresh(msg.sender, msg.sender, repayAmount, InterestRateMode.VARIABLE);
+    }
+
+    /**
+     * @notice Sender repays their own borrow
+     * @param repayAmount The amount to repay, or -1 for the full outstanding amount
+     * @return error Always NO_ERROR for compatilibily with Venus core tooling
+     * custom:events Emits RepayBorrow event; may emit AccrueInterest
+     * custom:access Not restricted
+     */
+    function repayBorrowStable(uint256 repayAmount) internal nonReentrant returns (uint256) {
+        accrueInterest();
+        // _repayBorrowFresh emits repay-borrow-specific logs on errors, so we don't need to
+        repayBorrowFresh(msg.sender, msg.sender, repayAmount, InterestRateMode.STABLE);
+        return uint256(MathError.NO_ERROR);
     }
 
     /**
@@ -1097,7 +1342,22 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
             return (fail(Error(error), FailureInfo.REPAY_BEHALF_ACCRUE_INTEREST_FAILED), 0);
         }
         // repayBorrowFresh emits repay-borrow-specific logs on errors, so we don't need to
-        return repayBorrowFresh(msg.sender, borrower, repayAmount);
+        return repayBorrowFresh(msg.sender, borrower, repayAmount, InterestRateMode.VARIABLE);
+    }
+
+    /**
+     * @notice Sender repays a borrow belonging to borrower
+     * @param borrower the account with the debt being payed off
+     * @param repayAmount The amount to repay, or -1 for the full outstanding amount
+     * @return error Always NO_ERROR for compatilibily with Venus core tooling
+     * custom:events Emits RepayBorrow event; may emit AccrueInterest
+     * custom:access Not restricted
+     */
+    function repayBorrowStableBehalf(address borrower, uint repayAmount) internal nonReentrant returns (uint) {
+        accrueInterest();
+        // _repayBorrowFresh emits repay-borrow-specific logs on errors, so we don't need to
+        repayBorrowFresh(msg.sender, borrower, repayAmount, InterestRateMode.STABLE);
+        return uint(MathError.NO_ERROR);
     }
 
     /**
@@ -1105,9 +1365,15 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
      * @param payer The account paying off the borrow
      * @param borrower The account with the debt being payed off
      * @param repayAmount The amount of undelrying tokens being returned
+     * @param interestRateMode The interest rate mode of the debt the user wants to repay: 1 for Stable, 2 for Variable
      * @return (uint, uint) An error code (0=success, otherwise a failure, see ErrorReporter.sol), and the actual repayment amount.
      */
-    function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint, uint) {
+    function repayBorrowFresh(
+        address payer,
+        address borrower,
+        uint repayAmount,
+        InterestRateMode interestRateMode
+    ) internal returns (uint, uint) {
         /* Fail if repayBorrow not allowed */
         uint allowed = comptroller.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
         if (allowed != 0) {
@@ -1122,30 +1388,20 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.REPAY_BORROW_FRESHNESS_CHECK), 0);
         }
 
-        RepayBorrowLocalVars memory vars;
+        uint256 accountBorrowsPrev;
+        if (InterestRateMode(interestRateMode) == InterestRateMode.STABLE) {
+            accountBorrowsPrev = _updateUserStableBorrowBalance(borrower);
+        } else {
+            /* We fetch the amount the borrower owes, with accumulated interest */
+            (, accountBorrowsPrev) = borrowBalanceStoredInternal(borrower);
+        }
 
-        /* We remember the original borrowerIndex for verification purposes */
-        vars.borrowerIndex = accountBorrows[borrower].interestIndex;
-
-        /* We fetch the amount the borrower owes, with accumulated interest */
-        (vars.mathErr, vars.accountBorrows) = borrowBalanceStoredInternal(borrower);
-        if (vars.mathErr != MathError.NO_ERROR) {
-            return (
-                failOpaque(
-                    Error.MATH_ERROR,
-                    FailureInfo.REPAY_BORROW_ACCUMULATED_BALANCE_CALCULATION_FAILED,
-                    uint(vars.mathErr)
-                ),
-                0
-            );
+        if (accountBorrowsPrev == 0) {
+            return (uint(Error.NO_ERROR), 0);
         }
 
         /* If repayAmount == -1, repayAmount = accountBorrows */
-        if (repayAmount == type(uint).max) {
-            vars.repayAmount = vars.accountBorrows;
-        } else {
-            vars.repayAmount = repayAmount;
-        }
+        uint256 repayAmountFinal = repayAmount > accountBorrowsPrev ? accountBorrowsPrev : repayAmount;
 
         /////////////////////////
         // EFFECTS & INTERACTIONS
@@ -1158,31 +1414,232 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
          *  doTransferIn reverts if anything goes wrong, since we can't be sure if side effects occurred.
          *   it returns the amount actually transferred, in case of a fee.
          */
-        vars.actualRepayAmount = doTransferIn(payer, vars.repayAmount);
+        uint256 actualRepayAmount = doTransferIn(payer, repayAmountFinal);
 
         /*
          * We calculate the new borrower and total borrow balances, failing on underflow:
          *  accountBorrowsNew = accountBorrows - actualRepayAmount
          *  totalBorrowsNew = totalBorrows - actualRepayAmount
          */
-        (vars.mathErr, vars.accountBorrowsNew) = subUInt(vars.accountBorrows, vars.actualRepayAmount);
-        require(vars.mathErr == MathError.NO_ERROR, "REPAY_BORROW_NEW_ACCOUNT_BORROW_BALANCE_CALCULATION_FAILED");
+        uint256 accountBorrowsNew = accountBorrowsPrev.sub(actualRepayAmount);
+        uint256 totalBorrowsNew = totalBorrows.sub(actualRepayAmount);
 
-        (vars.mathErr, vars.totalBorrowsNew) = subUInt(totalBorrows, vars.actualRepayAmount);
-        require(vars.mathErr == MathError.NO_ERROR, "REPAY_BORROW_NEW_TOTAL_BALANCE_CALCULATION_FAILED");
+        if (InterestRateMode(interestRateMode) == InterestRateMode.STABLE) {
+            uint256 stableBorrowsNew = stableBorrows - actualRepayAmount;
 
-        /* We write the previously calculated values into storage */
-        accountBorrows[borrower].principal = vars.accountBorrowsNew;
-        accountBorrows[borrower].interestIndex = borrowIndex;
-        totalBorrows = vars.totalBorrowsNew;
+            uint256 averageStableBorrowRateNew;
+            if (stableBorrowsNew == 0) {
+                averageStableBorrowRateNew = 0;
+            } else {
+                uint256 stableRateMantissa = accountStableBorrows[borrower].stableRateMantissa;
+                averageStableBorrowRateNew = (
+                    stableBorrows.mul(averageStableBorrowRate).sub(actualRepayAmount.mul(stableRateMantissa))
+                ).div(stableBorrowsNew);
+            }
+
+            accountStableBorrows[borrower].principal = accountBorrowsNew;
+            accountStableBorrows[borrower].interestIndex = stableBorrowIndex;
+
+            stableBorrows = stableBorrowsNew;
+            averageStableBorrowRate = averageStableBorrowRateNew;
+        } else {
+            accountBorrows[borrower].principal = accountBorrowsNew;
+            accountBorrows[borrower].interestIndex = borrowIndex;
+        }
+        totalBorrows = totalBorrowsNew;
 
         /* We emit a RepayBorrow event */
-        emit RepayBorrow(payer, borrower, vars.actualRepayAmount, vars.accountBorrowsNew, vars.totalBorrowsNew);
+        emit RepayBorrow(payer, borrower, actualRepayAmount, accountBorrowsNew, totalBorrowsNew);
 
         /* We call the defense hook */
-        comptroller.repayBorrowVerify(address(this), payer, borrower, vars.actualRepayAmount, vars.borrowerIndex);
+        comptroller.repayBorrowVerify(address(this), payer, borrower, actualRepayAmount, borrowIndex);
 
-        return (uint(Error.NO_ERROR), vars.actualRepayAmount);
+        return (uint(Error.NO_ERROR), actualRepayAmount);
+    }
+
+    /**
+     * @notice Checks before swapping borrow rate mode
+     * @param account Address of the borrow holder
+     * @return (uint256, uint256) returns the variableDebt and stableDebt for the account
+     */
+    function _swapBorrowRateModePreCalculation(address account) internal returns (uint256, uint256) {
+        /* Fail if swapBorrowRateMode not allowed */
+        comptroller.preSwapBorrowRateModeHook(address(this));
+
+        accrueInterest();
+
+        /* Verify market's block number equals current block number */
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert("math error");
+        }
+
+        (, uint256 variableDebt) = borrowBalanceStoredInternal(account);
+        uint256 stableDebt = _updateUserStableBorrowBalance(account);
+
+        return (variableDebt, stableDebt);
+    }
+
+    /**
+     * @notice Update states for the stable borrow while swapping
+     * @param swappedAmount Amount need to be swapped
+     * @param stableDebt Stable debt for the account
+     * @param variableDebt Variable debt for the account
+     * @param account Address of the account
+     * @param accountBorrowsNew New stable borrow for the account
+     * @return (uint256, uint256) returns updated stable borrow for the account and updated average stable borrow rate
+     */
+    function _updateStatesForStableRateSwap(
+        uint256 swappedAmount,
+        uint256 stableDebt,
+        uint256 variableDebt,
+        address account,
+        uint256 accountBorrowsNew
+    ) internal returns (uint256, uint256) {
+        uint256 stableBorrowsNew = stableBorrows + swappedAmount;
+        uint256 stableBorrowRate = stableBorrowRatePerBlock();
+
+        uint256 averageStableBorrowRateNew = ((stableBorrows * averageStableBorrowRate) +
+            (swappedAmount * stableBorrowRate)) / stableBorrowsNew;
+
+        uint256 stableRateMantissaNew = ((stableDebt * accountStableBorrows[account].stableRateMantissa) +
+            (swappedAmount * stableBorrowRate)) / accountBorrowsNew;
+
+        /////////////////////////
+        // EFFECTS & INTERACTIONS
+        // (No safe failures beyond this point)
+
+        accountStableBorrows[account].principal = accountBorrowsNew;
+        accountStableBorrows[account].interestIndex = stableBorrowIndex;
+        accountStableBorrows[account].stableRateMantissa = stableRateMantissaNew;
+
+        accountBorrows[account].principal = variableDebt - swappedAmount;
+        accountBorrows[account].interestIndex = borrowIndex;
+
+        return (stableBorrowsNew, averageStableBorrowRateNew);
+    }
+
+    /**
+     * @notice Update states for the variable borrow during the swap
+     * @param swappedAmount Amount need to be swapped
+     * @param stableDebt Stable debt for the account
+     * @param variableDebt Variable debt for the account
+     * @param account Address of the account
+     * @return (uint256, uint256) returns updated stable borrow for the account and updated average stable borrow rate
+     */
+    function _updateStatesForVariableRateSwap(
+        uint256 swappedAmount,
+        uint256 stableDebt,
+        uint256 variableDebt,
+        address account
+    ) internal returns (uint256, uint256) {
+        uint256 newStableDebt = stableDebt - swappedAmount;
+        uint256 stableBorrowsNew = stableBorrows - swappedAmount;
+
+        uint256 stableRateMantissa = accountStableBorrows[account].stableRateMantissa;
+        uint256 averageStableBorrowRateNew;
+        if (stableBorrowsNew == 0) {
+            averageStableBorrowRateNew = 0;
+        } else {
+            averageStableBorrowRateNew =
+                ((stableBorrows * averageStableBorrowRate) - (swappedAmount * stableRateMantissa)) /
+                stableBorrowsNew;
+        }
+
+        /////////////////////////
+        // EFFECTS & INTERACTIONS
+        // (No safe failures beyond this point)
+        accountBorrows[account].principal = variableDebt + swappedAmount;
+        accountBorrows[account].interestIndex = borrowIndex;
+
+        accountStableBorrows[account].principal = newStableDebt;
+        accountStableBorrows[account].interestIndex = stableBorrowIndex;
+
+        return (stableBorrowsNew, averageStableBorrowRateNew);
+    }
+
+    /**
+     * @dev Allows a borrower to swap his debt between stable and variable mode, or vice versa with specific amount
+     * @param rateMode The rate mode that the user wants to swap to
+     * @param sentAmount The amount that the user wants to convert form stable to variable mode or vice versa.
+     * custom:access Not restricted
+     **/
+    function swapBorrowRateModeWithAmount(uint256 rateMode, uint256 sentAmount) external {
+        address account = msg.sender;
+        (uint256 variableDebt, uint256 stableDebt) = _swapBorrowRateModePreCalculation(account);
+
+        uint256 stableBorrowsNew;
+        uint256 averageStableBorrowRateNew;
+        uint256 swappedAmount;
+
+        if (InterestRateMode(rateMode) == InterestRateMode.STABLE) {
+            require(variableDebt > 0, "vToken: swapBorrowRateMode variable debt is 0");
+
+            swappedAmount = sentAmount > variableDebt ? variableDebt : sentAmount;
+            uint256 accountBorrowsNew = stableDebt + swappedAmount;
+
+            (stableBorrowsNew, averageStableBorrowRateNew) = _updateStatesForStableRateSwap(
+                swappedAmount,
+                stableDebt,
+                variableDebt,
+                account,
+                accountBorrowsNew
+            );
+        } else {
+            require(stableDebt > 0, "vToken: swapBorrowRateMode stable debt is 0");
+
+            swappedAmount = sentAmount > stableDebt ? stableDebt : sentAmount;
+
+            (stableBorrowsNew, averageStableBorrowRateNew) = _updateStatesForVariableRateSwap(
+                swappedAmount,
+                stableDebt,
+                variableDebt,
+                account
+            );
+        }
+
+        stableBorrows = stableBorrowsNew;
+        averageStableBorrowRate = averageStableBorrowRateNew;
+
+        emit SwapBorrowRateMode(account, rateMode, swappedAmount);
+    }
+
+    /**
+     * @notice Rebalances the stable interest rate of a user to the current stable borrow rate.
+     * - Users can be rebalanced if the following conditions are satisfied:
+     *     1. Utilization rate is above rebalanceUtilizationRateThreshold.
+     *     2. Average market borrow rate should be less than the rebalanceRateFractionThreshold fraction of variable borrow rate.
+     * @param account The address of the account to be rebalanced
+     * custom:events RebalancedStableBorrowRate - Emits after rebalancing the stable borrow rate for the user.
+     **/
+    function rebalanceStableBorrowRate(address account) external {
+        accrueInterest();
+
+        validateRebalanceStableBorrowRate();
+        _updateUserStableBorrowBalance(account);
+
+        uint256 stableBorrowRate = stableBorrowRatePerBlock();
+
+        accountStableBorrows[account].stableRateMantissa = stableBorrowRate;
+
+        emit RebalancedStableBorrowRate(account, stableBorrowRate);
+    }
+
+    /// Validate the conditions to rebalance the stable borrow rate.
+    function validateRebalanceStableBorrowRate() public view returns (bool) {
+        require(rebalanceUtilizationRateThreshold > 0, "vToken: rebalanceUtilizationRateThreshold is not set.");
+        require(rebalanceRateFractionThreshold > 0, "vToken: rebalanceRateFractionThreshold is not set.");
+
+        uint256 utRate = utilizationRate(getCashPrior(), totalBorrows, totalReserves);
+        uint256 variableBorrowRate = interestRateModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
+        /// Utilization rate is above rebalanceUtilizationRateThreshold.
+        /// Average market borrow rate should be less than the rebalanceRateFractionThreshold fraction of variable borrow rate.
+        require(utRate >= rebalanceUtilizationRateThreshold, "vToken: low utilization rate for rebalacing.");
+        require(
+            _averageMarketBorrowRate() < (variableBorrowRate * rebalanceRateFractionThreshold),
+            "vToken: average borrow rate higher than variable rate threshold."
+        );
+
+        return true;
     }
 
     /**
@@ -1211,7 +1668,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         }
 
         // liquidateBorrowFresh emits borrow-specific logs on errors, so we don't need to
-        return liquidateBorrowFresh(payable(msg.sender), borrower, repayAmount, vTokenCollateral);
+        return liquidateBorrowFresh(msg.sender, borrower, repayAmount, vTokenCollateral);
     }
 
     /**
@@ -1263,15 +1720,15 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         }
 
         /* Fail if repayAmount = -1 */
-        if (repayAmount == type(uint).max) {
+        if (repayAmount == type(uint256).max) {
             return (fail(Error.INVALID_CLOSE_AMOUNT_REQUESTED, FailureInfo.LIQUIDATE_CLOSE_AMOUNT_IS_UINT_MAX), 0);
         }
 
         /* Fail if repayBorrow fails */
-        (uint repayBorrowError, uint actualRepayAmount) = repayBorrowFresh(liquidator, borrower, repayAmount);
-        if (repayBorrowError != uint(Error.NO_ERROR)) {
-            return (fail(Error(repayBorrowError), FailureInfo.LIQUIDATE_REPAY_BORROW_FRESH_FAILED), 0);
-        }
+        (, uint actualRepayAmount) = repayBorrowFresh(liquidator, borrower, repayAmount, InterestRateMode.VARIABLE);
+        (, uint actualRepayAmountStable) = repayBorrowFresh(liquidator, borrower, repayAmount, InterestRateMode.STABLE);
+
+        actualRepayAmount += actualRepayAmountStable;
 
         /////////////////////////
         // EFFECTS & INTERACTIONS
@@ -1288,7 +1745,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         /* Revert if borrower collateral token balance < seizeTokens */
         require(vTokenCollateral.balanceOf(borrower) >= seizeTokens, "LIQUIDATE_SEIZE_TOO_MUCH");
 
-        // If this is also the collateral, run seizeInternal to avoid re-entrancy, otherwise make an external override call
+        // If this is also the collateral, run seizeInternal to avoid re-entrancy, otherwise make an external call
         uint seizeError;
         if (address(vTokenCollateral) == address(this)) {
             seizeError = seizeInternal(address(this), liquidator, borrower, seizeTokens);
@@ -1551,26 +2008,90 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         return uint(Error.NO_ERROR);
     }
 
+    /**
+     * @notice Updates the stable interest rate model (requires fresh interest accrual)
+     * @dev Admin function to update the stable interest rate model
+     * @param newStableInterestRateModel The new stable interest rate model to use
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function _setStableInterestRateModelFresh(StableRateModel newStableInterestRateModel) internal returns (uint256) {
+        // Used to store old model for use in the event that is emitted on success
+        StableRateModel oldStableInterestRateModel;
+
+        // Track the market's current stable interest rate model
+        oldStableInterestRateModel = stableRateModel;
+
+        // Ensure invoke newInterestRateModel.isInterestRateModel() returns true
+        require(newStableInterestRateModel.isInterestRateModel(), "marker method returned false");
+
+        // Set the interest rate model to newStableInterestRateModel
+        stableRateModel = newStableInterestRateModel;
+
+        // Emit NewMarketStableInterestRateModel(oldStableInterestRateModel, newStableInterestRateModel)
+        emit NewMarketStableInterestRateModel(oldStableInterestRateModel, newStableInterestRateModel);
+
+        return uint(Error.NO_ERROR);
+    }
+
     /*** Safe Token ***/
 
     /**
      * @dev Performs a transfer in, reverting upon failure. Returns the amount actually transferred to the protocol, in case of a fee.
      *  This may revert due to insufficient balance or insufficient allowance.
      */
-    function doTransferIn(address from, uint amount) internal virtual returns (uint) {}
+    function doTransferIn(address from, uint amount) internal virtual returns (uint);
 
     /**
      * @dev Performs a transfer out, ideally returning an explanatory error code upon failure rather than reverting.
      *  If caller has not called checked protocol's balance, may revert due to insufficient cash held in the contract.
      *  If caller has checked protocol's balance, and verified it is >= amount, this should not revert in normal conditions.
      */
-    function doTransferOut(address payable to, uint amount) internal virtual {}
+    function doTransferOut(address payable to, uint amount) internal virtual;
+
+    /**
+     * @notice Return the borrow balance of account based on stored data
+     * @param account The address whose balance should be calculated
+     * @return borrowBalance the calculated balance
+     */
+    function _stableBorrowBalanceStored(address account) internal view returns (uint256, uint256, Exp memory) {
+        /* Get borrowBalance and borrowIndex */
+        StableBorrowSnapshot storage borrowSnapshot = accountStableBorrows[account];
+        Exp memory simpleStableInterestFactor;
+
+        /* If borrowBalance = 0 then borrowIndex is likely also 0.
+         * Rather than failing the calculation with a division by 0, we immediately return 0 in this case.
+         */
+        if (borrowSnapshot.principal == 0) {
+            return (0, borrowSnapshot.interestIndex, simpleStableInterestFactor);
+        }
+
+        uint256 currentBlockNumber = getBlockNumber();
+
+        /* Short-circuit accumulating 0 interest */
+        if (borrowSnapshot.lastBlockAccrued == currentBlockNumber) {
+            return (borrowSnapshot.principal, borrowSnapshot.interestIndex, simpleStableInterestFactor);
+        }
+
+        /* Calculate the number of blocks elapsed since the last accrual */
+        uint256 blockDelta = currentBlockNumber - borrowSnapshot.lastBlockAccrued;
+
+        simpleStableInterestFactor = mul_(Exp({ mantissa: borrowSnapshot.stableRateMantissa }), blockDelta);
+
+        uint256 stableBorrowIndexNew = mul_ScalarTruncateAddUInt(
+            simpleStableInterestFactor,
+            borrowSnapshot.interestIndex,
+            borrowSnapshot.interestIndex
+        );
+        uint256 principalUpdated = (borrowSnapshot.principal * stableBorrowIndexNew) / borrowSnapshot.interestIndex;
+
+        return (principalUpdated, stableBorrowIndexNew, simpleStableInterestFactor);
+    }
 
     /**
      * @dev Function to simply retrieve block number
      *  This exists mainly for inheriting test contracts to stub this result.
      */
-    function getBlockNumber() internal view virtual returns (uint) {
+    function getBlockNumber() internal view returns (uint) {
         return block.number;
     }
 
@@ -1616,7 +2137,7 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
      * @dev This function does not accrue interest before calculating the exchange rate
      * @return Tuple of error code and calculated exchange rate scaled by 1e18
      */
-    function exchangeRateStoredInternal() internal view virtual returns (MathError, uint) {
+    function exchangeRateStoredInternal() internal view returns (MathError, uint) {
         uint _totalSupply = totalSupply;
         if (_totalSupply == 0) {
             /*
@@ -1648,6 +2169,28 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
         }
     }
 
+    /**
+     * @notice Sets the utilization threshold for stable rate rebalancing
+     * @param utilizationRateThreshold The utilization rate threshold
+     * custom:access Only Governance
+     */
+    function setRebalanceUtilizationRateThreshold(uint256 utilizationRateThreshold) external {
+        require(msg.sender == admin, "only admin can set ACL address");
+        require(utilizationRateThreshold > 0, "vToken: utilization rate should be greater than zero.");
+        rebalanceUtilizationRateThreshold = utilizationRateThreshold;
+    }
+
+    /**
+     * @notice Sets the fraction threshold for stable rate rebalancing
+     * @param fractionThreshold The fraction threshold for the validation of the stable rate rebalancing
+     * custom:access Only Governance
+     */
+    function setRebalanceRateFractionThreshold(uint256 fractionThreshold) external {
+        require(msg.sender == admin, "only admin can set ACL address");
+        require(fractionThreshold > 0, "vToken: fraction threshold should be greater than zero.");
+        rebalanceRateFractionThreshold = fractionThreshold;
+    }
+
     /*** Safe Token ***/
 
     /**
@@ -1655,5 +2198,5 @@ contract VToken is VTokenInterface, Exponential, TokenErrorReporter {
      * @dev This excludes the value of the current message, if any
      * @return The quantity of underlying owned by this contract
      */
-    function getCashPrior() internal view virtual returns (uint) {}
+    function getCashPrior() internal view virtual returns (uint);
 }

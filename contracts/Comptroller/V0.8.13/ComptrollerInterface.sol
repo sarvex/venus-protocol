@@ -84,6 +84,8 @@ abstract contract ComptrollerInterfaceG1 {
 
     function transferVerify(address vToken, address src, address dst, uint transferTokens) external virtual;
 
+    function preSwapBorrowRateModeHook(address vToken) external virtual;
+
     /*** Liquidity/Liquidation Calculations ***/
 
     function liquidateCalculateSeizeTokens(
